@@ -1,0 +1,821 @@
+import csv
+import re
+import sqlite3
+import tkinter as tk
+import unicodedata
+from datetime import date, datetime, timedelta
+from tkinter import filedialog, messagebox, ttk
+from tkinter import font as tkfont
+
+import database as db
+from screens import xlsx_io
+from screens.base import error, parse_date, pick_id
+from screens.modal import form_modal
+from screens.login import (BORDER, FONT, INPUT_BORDER, MUTED, NAVY, PAGE_BG, PLACEHOLDER, PRIMARY, SEL_BG, TEXT,
+                           rounded_rect)
+
+GREEN_FG, GREEN_BG = "#0E7A3B", "#E4F6EA"
+LINE, HEAD_BG = "#E6ECF7", "#F3F7FD"
+DANGER = "#C0392B"
+
+
+def fold(text):
+    """Bỏ dấu + chữ thường để tìm kiếm: 'Nguyễn Đức' -> 'nguyen duc'."""
+    s = unicodedata.normalize("NFD", str(text or "").lower().replace("đ", "d"))
+    return "".join(c for c in s if unicodedata.category(c) != "Mn")
+
+
+def _bg_of(widget):
+    try:
+        return widget.cget("bg")
+    except tk.TclError:
+        return PAGE_BG
+
+
+# ====================================================================== thành phần giao diện dùng chung
+class Card(tk.Frame):
+    """Khung trắng viền mảnh. Đặt nội dung vào `card.inner`. Có thể ép chiều cao bằng card.config(height=...)."""
+
+    def __init__(self, master):
+        super().__init__(master, bg=BORDER)
+        self.pack_propagate(False)
+        self.inner = tk.Frame(self, bg="white")
+        self.inner.pack(fill="both", expand=True, padx=1, pady=1)
+
+
+class Chip(tk.Canvas):
+    """Nút lọc dạng viên thuốc. chip.set(văn bản, đang chọn)."""
+    H = 40
+
+    def __init__(self, master, command):
+        super().__init__(master, height=self.H, width=80, bg=_bg_of(master), highlightthickness=0, cursor="hand2")
+        self.command, self.text, self.active = command, "", False
+        self.font = tkfont.Font(family=FONT, size=10, weight="bold")
+        self.bind("<Button-1>", lambda _e: self.command())
+
+    def set(self, text, active=False):
+        self.text, self.active = text, bool(active)
+        self.config(width=self.font.measure(text) + 36)
+        self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        w = int(self.cget("width"))
+        on = self.active
+        rounded_rect(self, 1, 1, w - 1, self.H - 1, 19, fill=SEL_BG if on else "white",
+                     outline=PRIMARY if on else BORDER)
+        self.create_text(w / 2, self.H / 2, text=self.text, font=self.font, fill=NAVY if on else "#33466A")
+
+
+def draw_icon(cv, name, cx, cy, color):
+    kw = dict(fill=color, width=2, capstyle="round", joinstyle="round")
+    if name == "plus":
+        cv.create_line(cx - 7, cy, cx + 7, cy, **kw)
+        cv.create_line(cx, cy - 7, cx, cy + 7, **kw)
+    elif name == "edit":
+        cv.create_line(cx - 6, cy + 6, cx + 5, cy - 5, **dict(kw, width=3))
+        cv.create_line(cx - 8, cy + 8, cx - 3, cy + 8, **kw)
+    elif name == "trash":
+        cv.create_line(cx - 8, cy - 4, cx + 8, cy - 4, **kw)
+        cv.create_line(cx - 3, cy - 7, cx + 3, cy - 7, **kw)
+        cv.create_line(cx - 5, cy - 2, cx - 4, cy + 8, cx + 4, cy + 8, cx + 5, cy - 2, **kw)
+    elif name == "list":
+        for dy in (-5, 0, 5):
+            cv.create_line(cx - 7, cy + dy, cx + 7, cy + dy, **kw)
+    elif name == "search":
+        cv.create_oval(cx - 7, cy - 7, cx + 3, cy + 3, outline=color, width=2)
+        cv.create_line(cx + 2, cy + 2, cx + 8, cy + 8, **kw)
+    elif name == "refresh":
+        cv.create_arc(cx - 7, cy - 7, cx + 7, cy + 7, start=40, extent=270, style="arc", outline=color, width=2)
+        cv.create_line(cx + 5, cy - 7, cx + 6, cy - 2, cx + 1, cy - 3, **kw)
+    elif name in ("sheet", "pdf"):                     # tờ giấy + (lưới | chữ)
+        cv.create_rectangle(cx - 6, cy - 8, cx + 6, cy + 8, outline=color, width=2)
+        if name == "sheet":
+            cv.create_line(cx - 6, cy, cx + 6, cy, fill=color, width=2)
+            cv.create_line(cx, cy - 8, cx, cy + 8, fill=color, width=2)
+        else:
+            cv.create_line(cx - 3, cy - 2, cx + 3, cy - 2, fill=color, width=2)
+            cv.create_line(cx - 3, cy + 3, cx + 3, cy + 3, fill=color, width=2)
+    elif name == "print":
+        cv.create_rectangle(cx - 8, cy - 2, cx + 8, cy + 6, outline=color, width=2)
+        cv.create_rectangle(cx - 4, cy - 8, cx + 4, cy - 2, outline=color, width=2)
+        cv.create_rectangle(cx - 4, cy + 3, cx + 4, cy + 8, outline=color, width=2)
+    elif name == "chart":
+        cv.create_line(cx - 7, cy + 8, cx - 7, cy + 1, **kw)
+        cv.create_line(cx, cy + 8, cx, cy - 5, **kw)
+        cv.create_line(cx + 7, cy + 8, cx + 7, cy - 1, **kw)
+    elif name == "bell":
+        cv.create_arc(cx - 7, cy - 8, cx + 7, cy + 6, start=0, extent=180, style="arc", outline=color, width=2)
+        cv.create_line(cx - 7, cy - 1, cx - 7, cy + 5, cx + 7, cy + 5, cx + 7, cy - 1, **kw)
+        cv.create_line(cx - 2, cy + 8, cx + 2, cy + 8, **kw)
+    elif name in ("down", "up"):                       # mũi tên + khay
+        d = 1 if name == "down" else -1
+        cv.create_line(cx, cy - 7 * d, cx, cy + 3 * d, **kw)
+        cv.create_line(cx - 4, cy - 1 * d, cx, cy + 3 * d, cx + 4, cy - 1 * d, **kw)
+        cv.create_line(cx - 7, cy + 8 * d, cx + 7, cy + 8 * d, **kw)
+
+
+class IconButton(tk.Canvas):
+    """Nút có biểu tượng vẽ sẵn. style: primary | outline | danger. set_enabled(False) để làm mờ."""
+    H = 44
+    # bg, bg khi rê chuột, chữ, viền, chữ khi vô hiệu
+    STYLES = {"primary": (PRIMARY, NAVY, "white", PRIMARY, "#9DB8E8"),
+              "outline": ("white", "#EEF4FF", NAVY, INPUT_BORDER, "#9AA8C0"),
+              "danger": ("white", "#FDECEC", DANGER, "#F0CFCB", "#E4A9A3")}
+
+    def __init__(self, master, text, icon, command, style="outline", enabled=True):
+        self.font = tkfont.Font(family=FONT, size=10, weight="bold")
+        super().__init__(master, height=self.H, width=self.font.measure(text) + 62, bg=_bg_of(master),
+                         highlightthickness=0)
+        self.text, self.icon, self.command, self.style = text, icon, command, style
+        self.enabled, self.hover = enabled, False
+        self.bind("<Enter>", lambda _e: self._set_hover(True))
+        self.bind("<Leave>", lambda _e: self._set_hover(False))
+        self.bind("<Button-1>", self._click)
+        self._draw()
+
+    def set_enabled(self, flag):
+        self.enabled = bool(flag)
+        self._draw()
+
+    def _set_hover(self, flag):
+        self.hover = flag
+        self._draw()
+
+    def _click(self, _e=None):
+        if self.enabled:
+            self.command()
+
+    def _draw(self):
+        bg, hover, fg, border, dis = self.STYLES[self.style]
+        self.delete("all")
+        self.config(cursor="hand2" if self.enabled else "arrow")
+        w = int(self.cget("width"))
+        if not self.enabled:
+            fill, line, color = ("#EEF2F9" if self.style == "primary" else "white"), BORDER, dis
+            if self.style == "primary":
+                fill, line = "#BFD3F5", "#BFD3F5"
+                color = "white"
+        else:
+            fill, line, color = (hover if self.hover else bg), border, fg
+        rounded_rect(self, 1, 1, w - 1, self.H - 1, 10, fill=fill, outline=line)
+        draw_icon(self, self.icon, 28, self.H / 2, color)
+        self.create_text(46, self.H / 2, text=self.text, anchor="w", font=self.font, fill=color)
+
+
+class SearchBox(tk.Frame):
+    """Ô tìm kiếm có biểu tượng kính lúp và chữ gợi ý. Gắn với tk.StringVar `var` (ghi đè var.set() vẫn hiển thị đúng)."""
+
+    def __init__(self, master, var, placeholder, width=340):
+        super().__init__(master, bg=INPUT_BORDER, width=width, height=46)
+        self.pack_propagate(False)
+        inner = tk.Frame(self, bg="white")
+        inner.pack(fill="both", expand=True, padx=1, pady=1)
+        icon = tk.Canvas(inner, width=40, height=44, bg="white", highlightthickness=0)
+        icon.create_oval(14, 14, 25, 25, outline=PLACEHOLDER, width=2)
+        icon.create_line(24, 24, 30, 30, fill=PLACEHOLDER, width=2, capstyle="round")
+        icon.pack(side="left")
+        self.var = var
+        self.entry = tk.Entry(inner, textvariable=var, bd=0, relief="flat", font=(FONT, 11), bg="white", fg=TEXT,
+                              insertbackground=TEXT, highlightthickness=0)
+        self.entry.pack(side="left", fill="both", expand=True, padx=(0, 10), pady=10)
+        self.hint = tk.Label(inner, text=placeholder, bg="white", fg=PLACEHOLDER, font=(FONT, 10), anchor="w")
+        self.hint.place(in_=self.entry, x=0, rely=0.5, anchor="w")
+        self.hint.bind("<Button-1>", lambda _e: self.entry.focus_set())
+        var.trace_add("write", lambda *_: self._sync())
+        self._sync()
+
+    def _sync(self):
+        try:
+            if self.var.get():
+                self.hint.place_forget()
+            else:
+                self.hint.place(in_=self.entry, x=0, rely=0.5, anchor="w")
+        except tk.TclError:                              # widget đã bị hủy khi chuyển trang
+            pass
+
+
+class DataTable(tk.Frame):
+    """Bảng vẽ bằng Canvas: cột radio chọn dòng, tiêu đề cố định, cuộn dọc, bấm đôi để mở.
+
+    columns: [(khóa, tiêu đề, rộng tối thiểu, tỉ lệ giãn)]; key: tên cột khóa chính (vd. "MaPhong").
+    Lớp con có thể ghi đè _draw_cell(key, row, x, cy, maxw, tag) -> True nếu tự vẽ ô đó.
+    """
+    HEAD_H, ROW_H, RADIO_W = 46, 47, 52
+    bold_keys = ()
+    navy_keys = ()
+
+    def __init__(self, master, on_select, on_open, columns, key):
+        super().__init__(master, bg="white")
+        self.on_select, self.on_open, self.columns, self.key = on_select, on_open, columns, key
+        self.rows, self.selected = [], None
+        self.f_norm = tkfont.Font(family=FONT, size=10)
+        self.f_bold = tkfont.Font(family=FONT, size=10, weight="bold")
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+        self.head = tk.Canvas(self, height=self.HEAD_H, bg=HEAD_BG, highlightthickness=0)
+        self.head.grid(row=0, column=0, sticky="ew")
+        self.body = tk.Canvas(self, bg="white", highlightthickness=0, yscrollincrement=24, cursor="hand2")
+        self.body.grid(row=1, column=0, sticky="nsew")
+        self.sb = ttk.Scrollbar(self, orient="vertical", command=self.body.yview)
+        self.body.configure(yscrollcommand=self._on_scroll)
+        self.body.bind("<Configure>", lambda _e: self._draw())
+        self.body.bind("<Button-1>", self._click)
+        self.body.bind("<Double-1>", self._double)
+        for ev in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.body.bind(ev, self._wheel)
+
+    # ---- dữ liệu
+    def load(self, rows):
+        self.rows = list(rows)
+        if self.selected is not None and all(r[self.key] != self.selected for r in self.rows):
+            self.selected = None
+            self.on_select(None)
+        self._draw()
+
+    def select(self, ident, scroll=False):
+        old, self.selected = self.selected, ident
+        self._draw()
+        if scroll and ident is not None:
+            idx = next((i for i, r in enumerate(self.rows) if r[self.key] == ident), None)
+            total = max(len(self.rows) * self.ROW_H, 1)
+            if idx is not None and total > self.body.winfo_height() > 1:
+                top, h = self.body.canvasy(0), self.body.winfo_height()
+                y1 = idx * self.ROW_H
+                if y1 < top or y1 + self.ROW_H > top + h:
+                    self.body.yview_moveto(max(0.0, min(y1 - self.ROW_H, total - h) / total))
+        if old != ident:
+            self.on_select(ident)
+
+    # ---- vẽ
+    def _layout(self, width):
+        avail = max(width - self.RADIO_W, 1)
+        mins = sum(c[2] for c in self.columns)
+        extra = max(0, avail - mins)
+        wsum = sum(c[3] for c in self.columns) or 1
+        out, x = [], self.RADIO_W
+        for key, _head, mn, wt in self.columns:
+            w = mn + extra * wt / wsum
+            out.append((key, x, w))
+            x += w
+        return out
+
+    def _fit(self, text, maxw, font):
+        text = "" if text is None else str(text)
+        if font.measure(text) <= maxw:
+            return text
+        while text and font.measure(text + "…") > maxw:
+            text = text[:-1]
+        return text + "…" if text else ""
+
+    def _badge(self, text, fg, fill, tx, cy, maxw, tag):
+        text = self._fit(text, max(maxw - 24, 10), self.f_bold)
+        bw = min(maxw, self.f_bold.measure(text) + 24)
+        rounded_rect(self.body, tx, cy - 11, tx + bw, cy + 11, 11, fill=fill, outline=fill, tags=tag)
+        self.body.create_text(tx + bw / 2, cy, text=text, font=self.f_bold, fill=fg, tags=tag)
+
+    def _draw_cell(self, key, r, tx, cy, maxw, tag):
+        return False
+
+    def _draw(self):
+        b, h = self.body, self.head
+        b.delete("all")
+        h.delete("all")
+        w = max(b.winfo_width(), 1)
+        cols = self._layout(w)
+        for (key, x, cw), col in zip(cols, self.columns):
+            h.create_text(x + 12, self.HEAD_H / 2, text=col[1], anchor="w", font=self.f_bold, fill="#3B4A6B")
+        h.create_line(0, self.HEAD_H - 1, w + 2000, self.HEAD_H - 1, fill=LINE)
+        if not self.rows:
+            b.create_text(w / 2, 60, text="Không có dữ liệu phù hợp.", fill=MUTED, font=self.f_norm)
+            b.configure(scrollregion=(0, 0, w, 1))
+            return
+        for i, r in enumerate(self.rows):
+            y, cy, tag = i * self.ROW_H, i * self.ROW_H + self.ROW_H / 2, f"row{i}"
+            sel = r[self.key] == self.selected
+            if sel:
+                b.create_rectangle(0, y, w, y + self.ROW_H, fill=SEL_BG, outline=SEL_BG, tags=tag)
+            b.create_oval(18, cy - 8, 34, cy + 8, outline=PRIMARY if sel else "#8A97B0", width=2, tags=tag)
+            if sel:
+                b.create_oval(22, cy - 4, 30, cy + 4, fill=PRIMARY, outline=PRIMARY, tags=tag)
+            for key, x, cw in cols:
+                tx, maxw = x + 12, max(cw - 24, 10)
+                if self._draw_cell(key, r, tx, cy, maxw, tag):
+                    continue
+                bold = key in self.bold_keys
+                font = self.f_bold if bold else self.f_norm
+                b.create_text(tx, cy, text=self._fit(r.get(key), maxw, font), anchor="w", font=font, tags=tag,
+                              fill=NAVY if key in self.navy_keys else TEXT)
+            b.create_line(0, y + self.ROW_H - 1, w, y + self.ROW_H - 1, fill=LINE, tags=tag)
+        b.configure(scrollregion=(0, 0, w, len(self.rows) * self.ROW_H))
+
+    # ---- chuột
+    def _row_at(self, e):
+        i = int(self.body.canvasy(e.y) // self.ROW_H)
+        return self.rows[i][self.key] if 0 <= i < len(self.rows) else None
+
+    def _click(self, e):
+        ident = self._row_at(e)
+        if ident is not None:
+            self.select(ident)
+
+    def _double(self, e):
+        ident = self._row_at(e)
+        if ident is not None:
+            self.select(ident)
+            self.on_open()
+
+    def _wheel(self, e):
+        step = -1 if (getattr(e, "num", 0) == 4 or getattr(e, "delta", 0) > 0) else 1
+        self.body.yview_scroll(step * 2, "units")
+
+    def _on_scroll(self, first, last):
+        self.sb.set(first, last)
+        if float(first) > 0 or float(last) < 1:
+            self.sb.grid(row=1, column=1, sticky="ns")
+        else:
+            self.sb.grid_remove()
+
+
+# ====================================================================== dữ liệu sinh viên
+FILTERS = ["Tất cả", "Đang ở KTX", "Chưa xếp phòng"]
+STUDENT_COLS = [("MaSV", "Mã SV", 84, 0.7), ("HoTen", "Họ và tên", 160, 1.5), ("NgaySinh", "Ngày sinh", 104, 0.9),
+                ("GioiTinh", "Giới tính", 84, 0.7), ("Lop", "Lớp", 110, 1.0), ("SDT", "SĐT", 112, 1.0),
+                ("QueQuan", "Quê quán", 112, 1.1), ("Phong", "Phòng đang ở", 124, 1.0)]
+# các cột dữ liệu của một sinh viên (không gồm MaSV) - dùng chung cho form, INSERT/UPDATE và nhập Excel
+SV_COLS = ("HoTen", "NgaySinh", "GioiTinh", "Lop", "SDT", "QueQuan", "CCCD", "Email")
+SQL_INSERT = f"INSERT INTO SinhVien(MaSV,{','.join(SV_COLS)}) VALUES(?{',?' * len(SV_COLS)})"
+SQL_INSERT_AUTO = f"INSERT INTO SinhVien({','.join(SV_COLS)}) VALUES(?{',?' * (len(SV_COLS) - 1)})"
+SQL_UPDATE = f"UPDATE SinhVien SET {','.join(c + '=?' for c in SV_COLS)} WHERE MaSV=?"
+
+
+PROVINCES = [
+    "An Giang", "Bà Rịa - Vũng Tàu", "Bạc Liêu", "Bắc Giang", "Bắc Kạn", "Bắc Ninh", "Bến Tre", "Bình Dương",
+    "Bình Định", "Bình Phước", "Bình Thuận", "Cà Mau", "Cần Thơ", "Cao Bằng", "Đà Nẵng", "Đắk Lắk", "Đắk Nông",
+    "Điện Biên", "Đồng Nai", "Đồng Tháp", "Gia Lai", "Hà Giang", "Hà Nam", "Hà Nội", "Hà Tĩnh", "Hải Dương",
+    "Hải Phòng", "Hậu Giang", "Hòa Bình", "Hưng Yên", "Khánh Hòa", "Kiên Giang", "Kon Tum", "Lai Châu",
+    "Lâm Đồng", "Lạng Sơn", "Lào Cai", "Long An", "Nam Định", "Nghệ An", "Ninh Bình", "Ninh Thuận", "Phú Thọ",
+    "Phú Yên", "Quảng Bình", "Quảng Nam", "Quảng Ngãi", "Quảng Ninh", "Quảng Trị", "Sóc Trăng", "Sơn La",
+    "Tây Ninh", "Thái Bình", "Thái Nguyên", "Thanh Hóa", "Thừa Thiên Huế", "Tiền Giang", "TP. Hồ Chí Minh",
+    "Trà Vinh", "Tuyên Quang", "Vĩnh Long", "Vĩnh Phúc", "Yên Bái"]
+NO_ROOM = "Chưa xếp phòng"
+
+
+def room_options(current=None):
+    """Danh sách chọn phòng: 'Chưa xếp phòng' + các phòng còn chỗ (+ phòng sinh viên đang ở nếu đang sửa)."""
+    opts = [NO_ROOM]
+    for p in db.danh_sach_phong():
+        if p["TinhTrang"] in ("Trống", "Còn chỗ") or p["MaPhong"] == current:
+            opts.append(f"{p['MaPhong']} - {p['TenPhong']} (còn {max(p['SoGiuong'] - p['DangO'], 0)} chỗ)")
+    return opts
+
+
+def current_room(ma_sv):
+    """Mã phòng sinh viên đang ở (hợp đồng 'Đang thuê'), None nếu chưa xếp phòng."""
+    r = db.query("SELECT MaPhong FROM HopDong WHERE MaSV=? AND TrangThai='Đang thuê' LIMIT 1", (ma_sv,), one=True)
+    return r["MaPhong"] if r else None
+
+
+def assign_room(ma_sv, new_room):
+    """Xếp sinh viên vào phòng new_room (None = trả phòng) bằng cách tạo / kết thúc hợp đồng - giống trang Hợp đồng.
+    Hợp đồng mới bắt đầu hôm nay; hết hạn theo hợp đồng cũ (nếu còn hiệu lực) hoặc sau 12 tháng."""
+    today = date.today()
+    fmt = "%d/%m/%Y"
+    conn = db.get_conn()
+    try:
+        with conn:
+            cur = conn.execute("SELECT MaHD,MaPhong,NgayKetThuc FROM HopDong WHERE MaSV=? AND TrangThai='Đang thuê' "
+                               "LIMIT 1", (ma_sv,)).fetchone()
+            if cur and cur["MaPhong"] == new_room:
+                return
+            end = None
+            if cur:
+                conn.execute("UPDATE HopDong SET TrangThai='Đã kết thúc', NgayKetThuc=? WHERE MaHD=?",
+                             (today.strftime(fmt), cur["MaHD"]))
+                try:
+                    old_end = datetime.strptime(cur["NgayKetThuc"], fmt).date()
+                    end = old_end if old_end > today else None
+                except (TypeError, ValueError):
+                    end = None
+            if new_room is not None:
+                if end is None:
+                    try:
+                        end = today.replace(year=today.year + 1)
+                    except ValueError:                       # 29/02
+                        end = today.replace(year=today.year + 1, day=28)
+                conn.execute("INSERT INTO HopDong(MaSV,MaPhong,NgayBatDau,NgayKetThuc) VALUES(?,?,?,?)",
+                             (ma_sv, new_room, today.strftime(fmt), end.strftime(fmt)))
+    finally:
+        conn.close()
+
+
+def student_fields(editing=False, rooms=None):
+    """Các ô của hộp thoại Thêm / Cập nhật sinh viên (thứ tự và bố cục theo mẫu thiết kế).
+    Khi sửa, Mã SV chỉ đọc vì nó là khóa chính, hợp đồng và yêu cầu đang tham chiếu tới.
+    Chỉ Họ tên và Mã SV là bắt buộc; các ô còn lại để trống được, nhập thiếu số cũng được."""
+    return [{"key": "HoTen", "label": "Họ và tên", "ph": "Nguyễn Văn A", "required": True},
+            {"key": "MaSV", "label": "Mã sinh viên", "ph": "Nhập mã sinh viên", "required": True,
+             "readonly": editing},
+            {"key": "NgaySinh", "label": "Ngày sinh (dd/mm/yyyy)", "ph": "12/05/2005"},
+            {"key": "GioiTinh", "label": "Giới tính", "kind": "combo", "opts": ["Nam", "Nữ"]},
+            {"key": "CCCD", "label": "CCCD", "ph": "Số căn cước (có thể bỏ trống)"},
+            {"key": "SDT", "label": "Số điện thoại", "ph": "09xxxxxxxx"},
+            {"key": "Lop", "label": "Lớp", "ph": "DHKTPM17A"},
+            {"key": "Email", "label": "Email", "ph": "ten@example.com"},
+            {"key": "QueQuan", "label": "Quê quán (chọn tỉnh hoặc tự gõ)", "kind": "combo", "opts": PROVINCES,
+             "editable": True},
+            {"key": "PhongChon", "label": "Phòng", "kind": "combo", "opts": rooms or [NO_ROOM]}]
+
+
+
+EXPORT_HEADERS = ["Mã SV", "Họ và tên", "Ngày sinh", "Giới tính", "Lớp", "SĐT", "Quê quán", "CCCD", "Email",
+                  "Phòng đang ở"]
+EXPORT_KEYS = ["MaSV", "HoTen", "NgaySinh", "GioiTinh", "Lop", "SDT", "QueQuan", "CCCD", "Email", "Phong"]
+# tên cột (đã bỏ dấu) chấp nhận khi nhập file
+ALIASES = {"MaSV": {"ma sv", "masv", "mssv", "ma sinh vien"},
+           "HoTen": {"ho va ten", "ho ten", "hoten", "ten", "ten sinh vien"},
+           "NgaySinh": {"ngay sinh", "ngaysinh"},
+           "GioiTinh": {"gioi tinh", "gioitinh"},
+           "Lop": {"lop"},
+           "SDT": {"sdt", "so dien thoai", "dien thoai"},
+           "QueQuan": {"que quan", "quequan", "dia chi"},
+           "CCCD": {"cccd", "so cccd", "can cuoc cong dan", "can cuoc"},
+           "Email": {"email", "e-mail", "mail", "thu dien tu"}}
+EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+")
+
+
+def ensure_columns():
+    """Tự thêm cột CCCD, Email vào bảng SinhVien nếu file kytucxa.db cũ chưa có
+    (để trang vẫn chạy được kể cả khi chưa chép đè database.py mới)."""
+    have = {r["name"] for r in db.query("PRAGMA table_info(SinhVien)")}
+    for col in ("CCCD", "Email"):
+        if col not in have:
+            db.execute(f"ALTER TABLE SinhVien ADD COLUMN {col} TEXT")
+
+
+def load_students():
+    """Danh sách sinh viên + phòng đang ở (Phong, '' nếu chưa xếp) + cờ DangO."""
+    ensure_columns()
+    out = []
+    for r in db.query("""
+            SELECT s.MaSV, s.HoTen, s.NgaySinh, s.GioiTinh, s.Lop, s.SDT, s.QueQuan, s.CCCD, s.Email,
+                   (SELECT GROUP_CONCAT(p.TenPhong, ', ') FROM HopDong h JOIN Phong p ON p.MaPhong=h.MaPhong
+                    WHERE h.MaSV=s.MaSV AND h.TrangThai='Đang thuê') AS Phong
+            FROM SinhVien s ORDER BY s.MaSV"""):
+        d = {k: ("" if v is None else v) for k, v in dict(r).items()}
+        d["DangO"] = bool(d["Phong"])
+        d["_hay"] = fold(f"{d['MaSV']} {d['HoTen']} {d['Lop']} {d['SDT']}")
+        out.append(d)
+    return out
+
+
+def normalize_date(s):
+    """Chấp nhận dd/mm/yyyy, yyyy-mm-dd, số serial của Excel. Trả về 'dd/mm/yyyy' hoặc None nếu sai."""
+    s = (s or "").strip()
+    if not s:
+        return ""
+    try:
+        if re.fullmatch(r"\d{1,2}/\d{1,2}/\d{4}", s):
+            d = parse_date(s)
+        elif re.fullmatch(r"\d{4}-\d{1,2}-\d{1,2}([ T].*)?", s):
+            d = datetime.strptime(re.split(r"[ T]", s)[0], "%Y-%m-%d")
+        elif re.fullmatch(r"\d+(\.\d+)?", s) and 1 <= float(s) < 80000:
+            d = datetime(1899, 12, 30) + timedelta(days=int(float(s)))
+        else:
+            return None
+    except ValueError:
+        return None
+    if d.year < 1900 or d.date() > date.today():
+        return None
+    return d.strftime("%d/%m/%Y")
+
+
+def check_student(d):
+    """Chuẩn hóa + kiểm tra dữ liệu một sinh viên.
+    Trả về (dữ liệu sạch, khóa ô bị lỗi, thông báo lỗi); không lỗi thì khóa và thông báo đều là None."""
+    c = {k: re.sub(r"\s+", " ", str(d.get(k) or "")).strip() for k in SV_COLS}
+    if not c["HoTen"]:
+        return c, "HoTen", "Họ và tên không được để trống."
+    nd = normalize_date(c["NgaySinh"])
+    if nd is None:
+        return c, "NgaySinh", "Ngày sinh không hợp lệ (định dạng dd/mm/yyyy, không ở tương lai)."
+    c["NgaySinh"] = nd
+    g = fold(c["GioiTinh"])
+    if g in ("nam", "male", "m"):
+        c["GioiTinh"] = "Nam"
+    elif g in ("nu", "female", "f"):
+        c["GioiTinh"] = "Nữ"
+    elif g:
+        return c, "GioiTinh", "Giới tính chỉ nhận 'Nam' hoặc 'Nữ'."
+    # CCCD / SĐT: không bắt buộc đủ số, chỉ cần toàn chữ số (tối đa 12 / 11 số)
+    cccd = re.sub(r"[ .\-]", "", c["CCCD"])
+    if cccd and not re.fullmatch(r"\d{1,12}", cccd):
+        return c, "CCCD", "CCCD chỉ gồm chữ số (tối đa 12 số)."
+    c["CCCD"] = cccd
+    phone = re.sub(r"[ .\-()]", "", c["SDT"])
+    if phone and not re.fullmatch(r"\d{1,11}", phone):
+        return c, "SDT", "Số điện thoại chỉ gồm chữ số (tối đa 11 số)."
+    c["SDT"] = phone
+    if c["Email"] and not EMAIL_RE.fullmatch(c["Email"]):
+        return c, "Email", "Email cần có dạng ten@tenmien (có dấu @)."
+    return c, None, None
+
+
+def clean_student(d):
+    """Như check_student nhưng trả về (dữ liệu sạch, thông báo lỗi hoặc None) - dùng cho nhập Excel."""
+    c, _key, err = check_student(d)
+    return c, err
+
+
+# ====================================================================== bảng + màn hình
+class StudentTable(DataTable):
+    bold_keys, navy_keys = ("MaSV", "HoTen"), ("HoTen",)
+
+    def __init__(self, master, on_select, on_open):
+        super().__init__(master, on_select, on_open, STUDENT_COLS, "MaSV")
+
+    def _draw_cell(self, key, r, tx, cy, maxw, tag):
+        if key == "Phong":
+            if r["Phong"]:
+                self._badge(r["Phong"], GREEN_FG, GREEN_BG, tx, cy, maxw, tag)
+            else:
+                self.body.create_text(tx, cy, text="—", anchor="w", font=self.f_norm, fill=MUTED, tags=tag)
+            return True
+        return False
+
+
+class SinhVienScreen(tk.Frame):
+    def __init__(self, master, user=None):
+        super().__init__(master, bg=PAGE_BG)
+        self.user = user
+        self.filter, self.sel = FILTERS[0], None
+        self.rows, self.shown, self.counts = [], [], {n: 0 for n in FILTERS}
+        self.kw = tk.StringVar(master=self)              # main.goto() điền sẵn ô tìm kiếm qua biến này
+        self._build()
+        self.refresh()
+        self.kw.trace_add("write", lambda *_: self.apply())
+
+    # ---- dựng giao diện
+    def _build(self):
+        pad = dict(padx=40)
+        head = tk.Frame(self, bg=PAGE_BG)
+        head.pack(fill="x", pady=(30, 0), **pad)
+        box = tk.Frame(head, bg=PAGE_BG)
+        box.pack(side="left")
+        tk.Label(box, text="Quản lý sinh viên", bg=PAGE_BG, fg=NAVY, font=(FONT, 20, "bold")).pack(anchor="w")
+        tk.Label(box, text="Danh sách sinh viên đăng ký ở ký túc xá", bg=PAGE_BG, fg=MUTED,
+                 font=(FONT, 10)).pack(anchor="w")
+        SearchBox(head, self.kw, "Tìm theo tên, mã SV, lớp, SĐT...").pack(side="right", anchor="n")
+
+        bar = tk.Frame(self, bg=PAGE_BG)
+        bar.pack(fill="x", pady=(16, 0), **pad)
+        IconButton(bar, "Thêm", "plus", self.on_add, "primary").pack(side="left", padx=(0, 10))
+        self.btn_edit = IconButton(bar, "Sửa", "edit", self.on_edit, "outline", enabled=False)
+        self.btn_edit.pack(side="left", padx=(0, 10))
+        self.btn_del = IconButton(bar, "Xóa", "trash", self.on_delete, "danger", enabled=False)
+        self.btn_del.pack(side="left")
+        IconButton(bar, "Xuất Excel", "up", self.on_export, "outline").pack(side="right")
+        IconButton(bar, "Nhập Excel", "down", self.on_import, "outline").pack(side="right", padx=(0, 10))
+
+        chips = tk.Frame(self, bg=PAGE_BG)
+        chips.pack(fill="x", pady=(14, 14), **pad)
+        self.chips = {}
+        for name in FILTERS:
+            self.chips[name] = Chip(chips, lambda n=name: self.set_filter(n))
+            self.chips[name].pack(side="left", padx=(0, 10))
+
+        card = Card(self)
+        card.pack(fill="both", expand=True, padx=40, pady=(0, 30))
+        foot = tk.Frame(card.inner, bg="white")
+        foot.pack(side="bottom", fill="x")
+        tk.Frame(foot, bg=LINE, height=1).pack(fill="x")
+        row = tk.Frame(foot, bg="white")
+        row.pack(fill="x", padx=16, pady=10)
+        self.foot_l = tk.Label(row, bg="white", fg=MUTED, font=(FONT, 9))
+        self.foot_l.pack(side="left")
+        tk.Label(row, text="Bấm vào một dòng để chọn, sau đó dùng nút Sửa hoặc Xóa", bg="white", fg=MUTED,
+                 font=(FONT, 9)).pack(side="right")
+        self.table = StudentTable(card.inner, self._on_pick, self.on_edit)
+        self.table.pack(fill="both", expand=True)
+
+    # ---- dữ liệu / bộ lọc
+    def refresh(self):
+        self.rows = load_students()
+        self.counts = {"Tất cả": len(self.rows),
+                       "Đang ở KTX": sum(1 for r in self.rows if r["DangO"]),
+                       "Chưa xếp phòng": sum(1 for r in self.rows if not r["DangO"])}
+        self.apply()
+
+    def set_filter(self, name):
+        if name in FILTERS:
+            self.filter = name
+            self.apply()
+
+    def apply(self):
+        kw = fold(self.kw.get().strip())
+        self.shown = [r for r in self.rows
+                      if (self.filter == "Tất cả" or (r["DangO"] == (self.filter == "Đang ở KTX")))
+                      and (not kw or kw in r["_hay"])]
+        for name, chip in self.chips.items():
+            chip.set(f"{name} ({self.counts[name]})", name == self.filter)
+        self.table.selected = self.sel
+        self.table.load(self.shown)
+        self.foot_l.config(text=f"Hiển thị {len(self.shown)} / {len(self.rows)} sinh viên")
+
+    def _on_pick(self, ma):
+        self.sel = ma
+        self.btn_edit.set_enabled(ma is not None)
+        self.btn_del.set_enabled(ma is not None)
+
+    def _student(self, ma):
+        return next((r for r in self.rows if r["MaSV"] == ma), None)
+
+    # ---- thêm / sửa / xóa
+    @staticmethod
+    def _validator(editing_ma=None, cur_room=None):
+        """Hàm kiểm tra cho hộp thoại. editing_ma=None: đang THÊM (phải nhập + kiểm tra Mã SV mới);
+        có giá trị: đang SỬA sinh viên mang mã đó (Mã SV bị khóa, CCCD chỉ so với các sinh viên khác).
+        cur_room: mã phòng sinh viên đang ở (khi sửa) - giữ nguyên phòng này thì không cần kiểm tra chỗ trống."""
+        def check(v):
+            ma = None
+            if editing_ma is None:
+                raw = v.get("MaSV", "").strip()
+                if not raw:
+                    return None, ("MaSV", "Mã sinh viên không được để trống.")
+                if not (raw.isascii() and raw.isdigit() and 0 < int(raw) <= 9_999_999_999):
+                    return None, ("MaSV", "Mã sinh viên chỉ gồm chữ số (ví dụ: 2100006).")
+                ma = int(raw)
+                if db.query("SELECT 1 FROM SinhVien WHERE MaSV=?", (ma,), one=True):
+                    return None, ("MaSV", f"Mã sinh viên {ma} đã tồn tại.")
+            clean, key, err = check_student(v)
+            if err:
+                return None, (key, err)
+            # CCCD đủ 12 số thì không được trùng người khác (nhập thiếu số thì không so sánh)
+            if len(clean["CCCD"]) == 12 and db.query("SELECT 1 FROM SinhVien WHERE CCCD=? AND MaSV<>?",
+                                                     (clean["CCCD"], editing_ma or 0), one=True):
+                return None, ("CCCD", "CCCD này đã được dùng cho sinh viên khác.")
+            # phòng: "Chưa xếp phòng" -> None; còn lại phải còn chỗ (trừ khi giữ nguyên phòng đang ở)
+            choice = v.get("PhongChon", NO_ROOM)
+            clean["MaPhong"] = None if choice == NO_ROOM else pick_id(choice)
+            if clean["MaPhong"] is not None and clean["MaPhong"] != cur_room:
+                p = next((x for x in db.danh_sach_phong() if x["MaPhong"] == clean["MaPhong"]), None)
+                if p is None or p["TinhTrang"] not in ("Trống", "Còn chỗ"):
+                    return None, ("PhongChon", "Phòng này đã đầy hoặc đang bảo trì, hãy chọn phòng khác.")
+            if ma is not None:
+                clean["MaSV"] = ma
+            return clean, None
+        return check
+
+    def on_add(self):
+        d = form_modal(self, "Thêm sinh viên", student_fields(False, room_options()), validate=self._validator())
+        if not d:
+            return
+        try:
+            db.execute(SQL_INSERT, (d["MaSV"],) + tuple(d[c] for c in SV_COLS))
+        except sqlite3.IntegrityError:
+            return error("Không lưu được: mã sinh viên đã tồn tại.")
+        db.ghi_nhat_ky("sv", f"Thêm sinh viên **{d['HoTen']}**")
+        self._save_room(d)
+        self.filter = FILTERS[0]
+        self.kw.set("")
+        self.refresh()
+        self.table.select(d["MaSV"], scroll=True)
+
+    def on_edit(self):
+        r = self._student(self.sel)
+        if not r:
+            return
+        cur = current_room(r["MaSV"])
+        opts = room_options(cur)
+        values = dict(r, PhongChon=next((o for o in opts if cur is not None and o.startswith(f"{cur} - ")), NO_ROOM))
+        d = form_modal(self, "Cập nhật sinh viên", student_fields(True, opts), values,
+                       validate=self._validator(r["MaSV"], cur))
+        if not d:
+            return
+        d["MaSV"] = r["MaSV"]
+        db.execute(SQL_UPDATE, tuple(d[c] for c in SV_COLS) + (r["MaSV"],))
+        db.ghi_nhat_ky("sv", f"Cập nhật sinh viên **{d['HoTen']}**")
+        self._save_room(d, cur)
+        self.refresh()
+
+    @staticmethod
+    def _save_room(d, old_room=None):
+        """Ghi phòng đã chọn trong hộp thoại thành hợp đồng (tạo mới / chuyển phòng / trả phòng)."""
+        if d["MaPhong"] == old_room:
+            return
+        assign_room(d["MaSV"], d["MaPhong"])
+        if d["MaPhong"] is not None:
+            ten = db.query("SELECT TenPhong FROM Phong WHERE MaPhong=?", (d["MaPhong"],), one=True)["TenPhong"]
+            db.ghi_nhat_ky("phong", f"Đăng ký phòng {ten} – **{d['HoTen']}**")
+
+    def on_delete(self):
+        r = self._student(self.sel)
+        if not r:
+            return
+        if r["DangO"]:
+            return error(f"Sinh viên {r['HoTen']} đang ở phòng {r['Phong']}.\n"
+                         "Hãy kết thúc hợp đồng của sinh viên này trước khi xóa.")
+        if not messagebox.askyesno("Xác nhận", f"Bạn có chắc chắn muốn xóa sinh viên {r['HoTen']}?"):
+            return
+        try:
+            db.execute("DELETE FROM SinhVien WHERE MaSV=?", (r["MaSV"],))
+        except sqlite3.IntegrityError:
+            return error("Không thể xóa vì sinh viên này còn hợp đồng cũ hoặc yêu cầu liên quan.")
+        db.ghi_nhat_ky("sv", f"Xóa sinh viên **{r['HoTen']}**")
+        self.refresh()
+
+    # ---- xuất / nhập Excel
+    def on_export(self):
+        if not self.shown:
+            return messagebox.showinfo("Thông báo", "Không có dữ liệu để xuất.")
+        path = filedialog.asksaveasfilename(
+            parent=self, defaultextension=".xlsx", initialfile=f"sinh_vien_{date.today():%Y%m%d}.xlsx",
+            filetypes=[("Excel", "*.xlsx"), ("CSV", "*.csv")])
+        if not path:
+            return
+        data = [[r[k] for k in EXPORT_KEYS] for r in self.shown]
+        try:
+            if path.lower().endswith(".csv"):
+                with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                    w = csv.writer(f)
+                    w.writerow(EXPORT_HEADERS)
+                    w.writerows(data)
+            else:
+                xlsx_io.write_xlsx(path, EXPORT_HEADERS, data, widths=[10, 26, 14, 11, 14, 14, 18, 16, 28, 16],
+                                   sheet_name="Sinh viên")
+        except OSError as e:
+            return error(f"Không ghi được file: {e}")
+        messagebox.showinfo("Thành công", f"Đã xuất {len(data)} sinh viên ra file:\n{path}")
+
+    @staticmethod
+    def _read_table(path):
+        if path.lower().endswith(".xlsx"):
+            return xlsx_io.read_xlsx(path)
+        raw = open(path, "rb").read()
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text = raw.decode("cp1258", errors="replace")
+        try:
+            dialect = csv.Sniffer().sniff(text[:2048], delimiters=",;\t")
+        except csv.Error:
+            dialect = csv.excel
+        return [[c.strip() for c in row] for row in csv.reader(text.splitlines(), dialect)]
+
+    def on_import(self):
+        path = filedialog.askopenfilename(parent=self, filetypes=[("Excel / CSV", "*.xlsx *.csv"), ("Tất cả", "*.*")])
+        if not path:
+            return
+        try:
+            table = self._read_table(path)
+        except (OSError, ValueError, csv.Error) as e:
+            return error(f"Không đọc được file: {e}")
+        # tìm dòng tiêu đề trong 5 dòng đầu
+        colmap, start = {}, 0
+        for i, row in enumerate(table[:5]):
+            m = {k: j for j, cell in enumerate(row) for k, names in ALIASES.items() if fold(cell).strip() in names}
+            if "HoTen" in m:
+                colmap, start = m, i + 1
+                break
+        if not colmap:
+            return error("Không tìm thấy dòng tiêu đề có cột 'Họ và tên'.\n"
+                         "Hãy dùng file do nút 'Xuất Excel' tạo ra làm mẫu.")
+        added = updated = 0
+        errors = []
+        conn = db.get_conn()
+        try:
+            with conn:
+                for n, row in enumerate(table[start:], start=start + 1):
+                    if not any(str(c).strip() for c in row):
+                        continue
+                    raw = {k: (row[j] if j < len(row) else "") for k, j in colmap.items()}
+                    d, err = clean_student(raw)
+                    if err:
+                        errors.append(f"Dòng {n}: {err}")
+                        continue
+                    ma = raw.get("MaSV", "").strip()
+                    ma = int(ma) if ma.isdigit() and int(ma) > 0 else None
+                    vals = tuple(d[c] for c in SV_COLS)
+                    if ma and conn.execute("SELECT 1 FROM SinhVien WHERE MaSV=?", (ma,)).fetchone():
+                        # chỉ cập nhật các cột CÓ trong file, tránh xóa trắng CCCD/Email của file mẫu cũ
+                        cols = [c for c in SV_COLS if c in colmap]
+                        conn.execute(f"UPDATE SinhVien SET {','.join(c + '=?' for c in cols)} WHERE MaSV=?",
+                                     tuple(d[c] for c in cols) + (ma,))
+                        updated += 1
+                    elif ma:
+                        conn.execute(SQL_INSERT, (ma,) + vals)
+                        added += 1
+                    else:
+                        conn.execute(SQL_INSERT_AUTO, vals)
+                        added += 1
+        except sqlite3.Error as e:
+            return error(f"Lỗi cơ sở dữ liệu, không có dòng nào được lưu:\n{e}")
+        finally:
+            conn.close()
+        if added or updated:
+            db.ghi_nhat_ky("sv", f"Nhập Excel: thêm **{added}**, cập nhật **{updated}** sinh viên")
+        self.refresh()
+        msg = f"Đã thêm {added} và cập nhật {updated} sinh viên."
+        if errors:
+            msg += f"\n\nBỏ qua {len(errors)} dòng lỗi:\n" + "\n".join(errors[:8]) + ("\n..." if len(errors) > 8 else "")
+        (messagebox.showwarning if errors else messagebox.showinfo)("Kết quả nhập", msg)
