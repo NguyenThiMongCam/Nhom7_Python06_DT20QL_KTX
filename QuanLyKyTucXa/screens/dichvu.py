@@ -1,15 +1,4 @@
-"""Trang Dịch vụ & sửa chữa (quản trị) - cùng phong cách xanh trắng với các trang Sinh viên / Phòng.
 
-Bốn tab:
-- "Danh sách sự cố": phòng nào hỏng gì, ai phụ trách phòng, ngày gửi yêu cầu, ngày sửa, trạng thái
-- "Theo phòng": mỗi phòng một ô (kèm người phụ trách) với biểu tượng từng hạng mục đang hỏng
-- "Thu phí dịch vụ": phí cố định theo tháng (rác, wifi...) tính theo số người ở hoặc theo phòng, ghi nhận thu tiền
-- "Bảng giá dịch vụ": đơn giá điện, nước, internet, rác... (hóa đơn vẫn dùng bảng này)
-Nhấp đúp một sự cố để xem chi tiết: người phụ trách, người báo và đường tiến độ Gửi yêu cầu -> Nhận sửa -> Hoàn thành.
-
-Phụ thuộc: bảng/thẻ/ô tìm kiếm dùng chung của screens/sinhvien.py, hộp thoại screens/modal.py (báo lỗi ngay trong
-hộp thoại), biểu tượng + nút trong screens/uikit.py (không phụ thuộc phần vẽ icon của sinhvien.py).
-"""
 import re
 import sqlite3
 import tkinter as tk
