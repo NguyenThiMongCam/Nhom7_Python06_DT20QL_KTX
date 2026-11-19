@@ -1,4 +1,4 @@
-"""Ứng dụng Quản lý Ký túc xá - chạy: python main.py"""
+
 import tkinter as tk
 from tkinter import ttk
 
