@@ -1,4 +1,4 @@
-"""Thành phần giao diện dùng chung: bảng, hộp thoại nhập liệu, màn hình CRUD."""
+
 import sqlite3
 import tkinter as tk
 from datetime import datetime
